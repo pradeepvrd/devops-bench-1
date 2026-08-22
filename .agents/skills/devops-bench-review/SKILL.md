@@ -2,13 +2,14 @@
 name: devops-bench-review
 description: >
   Use when the user asks for a CODE review of devops-bench changes — e.g.
-  "review this PR", "review my changes", "review the working tree", "is this
+  "review this PR", "review my changes", "review the working tree", "code-review
+  this diff", "review this skill / AGENTS.md change", "is this
   harness/deployer/metric change sound". Reviews a PR (number/URL) or the
   current working tree and returns ranked findings with severity, file:line
-  evidence, and a concrete fix. Review-only: static analysis plus unit
-  tests/ruff; it NEVER runs benchmark evals or provisions infra. For a NEW or
-  CHANGED benchmark task (task.yaml + its stack), use the sibling task-review
-  skill instead.
+  evidence, and a concrete fix. Review-only: static analysis plus unit tests,
+  ruff, and format checks; it NEVER runs benchmark evals or provisions infra.
+  For a NEW or CHANGED benchmark task (task.yaml + its stack), use the sibling
+  `task-review` skill instead.
 ---
 
 # devops-bench code review
@@ -19,10 +20,10 @@ ranked findings a maintainer would act on. Each finding is
 actionable fix**, scoped to the change. Do not nitpick; do not invent findings to
 fill a quota. If nothing survives, say so.
 
-`devops_bench/` is the canonical pipeline. The top-level `deployers/`, `skills/`,
-and `scripts/` directories are placeholder scaffolding holding only a `README.md`
-each — the live code is under `devops_bench/`. For the layering, registries, and
-lifecycle, read
+`devops_bench/` is the canonical pipeline. The top-level `deployers/` and
+`skills/` directories hold a placeholder `README.md` each; `scripts/` holds the
+bastion and matrix shell scripts. The live Python is under `devops_bench/`. For
+the registries and lifecycle, read
 [architecture](../../../docs/components/architecture.md) and
 [glossary](../../../docs/components/glossary.md) rather than reconstructing them.
 
@@ -45,31 +46,9 @@ Analyze and report. Do **not** execute the benchmark, and never provision infra.
 
 If a lens needs a capability (sub-agent for an independent verifier pass, etc.),
 express the need generically and consult
-[harness-capabilities](../../references/harness-capabilities.md); degrade to doing
-it inline.
-
-Those two lists are also the shape of a permission profile, if you want your
-tool to enforce the boundary rather than rely on the skill honouring it: allow
-repository reads plus the test and lint commands, deny file writes and the whole
-infra toolchain, and keep `rm`, `sudo`, `git push` and `git commit` denied
-outright. Exact syntax differs per tool and the right allowlist depends on where
-you run, so treat that as the shape rather than a config to copy.
-
-## Apply the CodeRabbit guidelines — read them live
-
-Read `.coderabbit.yaml` at the repository root and apply its review guidelines
-as part of this review:
-
-- `reviews.instructions` — repo-wide review rules; apply them to everything in
-  scope.
-- `reviews.path_instructions` — a list of entries; apply each entry's
-  `instructions` to the files in scope matching its `path` glob.
-- `reviews.path_filters` — exclusions (e.g. `!uv.lock`, `!vendor/**`); skip the
-  files CodeRabbit excludes.
-
-Treat these as mandatory lenses of equal standing with this skill's own. If
-`.coderabbit.yaml` or those keys are missing, fall back to this skill's lenses
-and say so in the review output.
+[harness-capabilities](../../references/harness-capabilities.md); degrade to
+doing it inline. The same file has the permission-profile shape for enforcing
+the review-only boundary with tool permissions rather than trust.
 
 ## Gather the diff
 
@@ -88,9 +67,29 @@ or fails to fix it).
 
 ## Lenses
 
-Apply the lenses that fit the change. Most code wants Correctness, Testability, and
-Conventions; library/registry surfaces add API hygiene and Domain modeling.
-Changes under `.agents/` add Agent-facing docs.
+Apply the lenses that fit the change. Every change gets the CodeRabbit
+guidelines below — lenses of equal standing with the rest. Most code wants
+Correctness, Testability, and Conventions; library/registry surfaces add API
+hygiene and Domain modeling. Changes touching `devops_bench/` or `docs/` always
+add Vendor neutrality. Changes touching `.agents/**` or any `AGENTS.md` add
+Agent-facing docs.
+
+### CodeRabbit guidelines — read them live
+
+Read `.coderabbit.yaml` at the repository root and apply its review guidelines
+as part of this review:
+
+- `reviews.instructions` — repo-wide review rules; apply them to everything in
+  scope.
+- `reviews.path_instructions` — a list of entries; apply each entry's
+  `instructions` to the files in scope matching its `path` glob.
+- `reviews.path_filters` — skip the files CodeRabbit excludes.
+
+`.coderabbit.yaml` derives its rules from [AGENTS.md](../../../AGENTS.md)
+(`knowledge_base.code_guidelines`). If `.coderabbit.yaml` or those keys are
+missing, read [AGENTS.md](../../../AGENTS.md) directly for the repo-wide rules
+(the config's path-specific instructions have no fallback), apply this skill's
+lenses, and name in the review output which source you used.
 
 ### Correctness
 
@@ -142,10 +141,13 @@ state that should be an enum, and parallel lists that should be one list of reco
 
 ### Conventions
 
-- **Tooling:** `uv` for everything (`uv run …`, `uv add …` — not bare `pip`/`python`).
-- **Lint:** ruff with `E, F, I, UP, B, SIM`, line length 100. Run `uv run ruff check .`.
+- **Tooling:** `uv run …` / `uv add …`, never bare `pip`/`python` — repo-wide,
+  including `hack/` and `scripts/`, which the config's path globs don't reach.
+- **Lint:** run `uv run ruff check .`; pyproject.toml is the source of truth
+  for the rule set.
 - **Docstrings:** Google style — purpose; `Args` / `Returns` / `Attributes`;
-  `Raises`; concise, no implementation narration.
+  `Raises`; concise, no implementation narration. Not linted and not in
+  `.coderabbit.yaml` — check it by reading.
 - **Comments — over-commenting is a finding.** Self-documenting code needs no
   running commentary. Flag any comment that **narrates what the code does**
   (`# loop over the items`, `# increment counter`, a docstring-restating-the-body).
@@ -154,18 +156,18 @@ state that should be an enum, and parallel lists that should be one list of reco
   rationale). When you flag one, say whether the fix is "delete it" or "rewrite it
   to explain the *why*".
 
-### Vendor neutrality — beyond the config
+### Vendor neutrality — structural checks
 
-The terminology and env-var rules come from `.coderabbit.yaml` (step above).
-The checks below are the ones the config does not state — **run them on every
-change touching `devops_bench/` or `docs/`.** For the cloud-provider vs
-model-provider split (only the cloud axis is policed), see
+`.coderabbit.yaml` states the terminology and env-var rules, but it keys on
+strings and names. The checks below catch what survives a string match —
+**run them on every change touching `devops_bench/` or `docs/`.** For the
+cloud-provider vs model-provider split (only the cloud axis is policed), see
 [glossary.md](../../../docs/components/glossary.md).
 
-- **Error and log messages.** The most-missed surface, because the code is
-  neutral and only the string is not: `"could not reach the GKE cluster"`
-  raised from `core/` should read `"could not reach the cluster"`. Check log
-  strings as well as raised errors.
+- **Log strings, not just raised errors.** The config covers error messages;
+  log lines are the most-missed surface, because the code is neutral and only
+  the string is not: `"could not reach the GKE cluster"` emitted from `core/`
+  should read `"could not reach the cluster"`.
 - **Defaults and fallbacks.** A neutral parameter that quietly defaults to one
   provider (`location="us-central1"`, `provider="gcp"`) hard-codes a vendor
   through the back door. The established pattern is deduction that *raises*
@@ -178,17 +180,21 @@ model-provider split (only the cloud axis is policed), see
 - **Docs and docstring examples.** An example is user-facing text. Where a
   provider-specific example is genuinely clearest, label it as one rather than
   letting it read as the only way.
-- **Env-var reads.** Grep the diff for `get_env(` and `os.environ`. Treat
-  `GCP_PROJECT_ID`, `GOOGLE_CLOUD_*`, and `GKE_*` as the cloud families. The
-  module the read lives in — not the surrounding prose — decides. Provider
-  resolution belongs behind the `PROVIDERS` registry.
+- **Env-var reads — which module, not which words.** The config names the
+  variables; it cannot see where the read lives. Grep the diff for `get_env(`
+  and `os.environ` and check the module: `GCP_PROJECT_ID`, `GOOGLE_CLOUD_*`,
+  `GKE_*` resolved in a generic layer is a finding even when the surrounding
+  prose is neutral. Provider resolution belongs behind the `PROVIDERS`
+  registry.
 - **Two task trees.** The config's `tasks/<provider>/` carve-out is the on-disk
   task tree at the repo root, which is a different thing from the
   `devops_bench/tasks/` schema package — the latter is a generic layer. Write
   the pattern, not the instance: the carve-out is `tasks/<provider>/`, so
   `tasks/aws/` is as exempt as `tasks/gcp/` the day someone adds it.
 
-Over-flagging is its own failure mode — it trains authors to ignore the lens.
+Give the neutral replacement, not just the objection: "cloud project id",
+"target Kubernetes cluster", "the configured provider". Over-flagging trains
+authors to ignore the lens.
 
 ### Security
 
@@ -216,15 +222,16 @@ instructions an agent executes — review them as interfaces, not prose:
   the agent could read live or reach by pointer. A copy is justified only when
   the lookup is expensive or the convention is unwritten — the gotcha, the why.
 - **Right-sized loading.** Material every run needs is inline; material only
-  some paths need sits behind a link. Flag sprawl: a long flat section thins
-  attention across the excess.
+  some paths need sits behind a link. Flag a section that only one path reads
+  growing to dozens of lines — move it behind a link.
 - **Checkable completion.** Steps end on a bound the agent can test ("every
   touched function's callers checked"). Flag vague bounds ("ensure quality") —
-  they invite stopping early.
+  they invite stopping early. Prefer bounds that are also demanding — "every
+  rule in the config applied" forces legwork where "produce a list" does not.
 - **Positive instructions.** State the target behavior. Keep a prohibition
   only as a hard guardrail, paired with what to do instead.
-- **No-ops.** Flag instructions the agent already follows by default ("be
-  careful", "be thorough") — they spend load and change nothing.
+- **No-ops.** Flag adjective-only instructions that name no step, check, or
+  bound ("be careful", "be thorough") — they spend load and change nothing.
 - **Co-location.** One concept's definition, rules, and caveats live under one
   heading. Flag a meaning fragmented across sections.
 
@@ -248,5 +255,3 @@ Present a readable review (not raw JSON):
    knows the coverage.
 4. **Systemic note** (when applicable) — if several findings share a root cause,
    recommend the seam-level fix once instead of per-site patches.
-
-Scale effort to the ask. Never run the benchmark to produce a finding.

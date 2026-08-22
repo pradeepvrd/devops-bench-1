@@ -24,3 +24,13 @@ works on a bare harness with nothing but a shell.
 The **runner host** holds the durable run state (`RESUME_STAMP` under
 `~/matrix-runs/<stamp>/`), so even a bare harness — one shell, no sub-agents, no
 scheduler — can drive and re-attach to a run by polling files.
+
+## Permission-profile shape for the review skills
+
+The review skills' may-run / must-not-run lists are also the shape of a
+permission profile, if you want your tool to enforce the boundary rather than
+rely on the skill honouring it: allow repository reads plus the test and lint
+commands, deny file writes and the whole infra toolchain, and keep `rm`,
+`sudo`, `git push` and `git commit` denied outright. Exact syntax differs per
+tool and the right allowlist depends on where you run, so treat this as the
+shape rather than a config to copy.
