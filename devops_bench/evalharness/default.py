@@ -45,6 +45,15 @@ from devops_bench.core import (
     remove_minted,
 )
 from devops_bench.deployers.factory import get_deployer
+from devops_bench.detection import (
+    DEFAULT_BASELINE,
+    SensitiveAccessRule,
+    annotate_records,
+    baseline_from_granted_paths,
+    build_inventory_rules,
+    filter_rules_for_prompt,
+    load_ruleset,
+)
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
 from devops_bench.evalharness.reporter import ResultReporter
@@ -189,6 +198,20 @@ class DefaultEvalHarness(Harness):
         self.no_teardown = no_teardown if no_teardown is not None else get_bool("BENCH_NO_TEARDOWN")
         # Resolved once so capabilities and scoring observe the same value.
         self.use_mcp: bool = get_bool("BENCH_USE_MCP", True)
+        # Trajectory-based cheating detection is flag-only: it annotates each
+        # record with a ``cheating_report`` and never touches scores or
+        # ``validated``. Extra rules load from an optional YAML file — loaded
+        # here so a bad BENCH_CHEAT_RULES path fails loud at construction
+        # (an operator config error) instead of being swallowed by the
+        # best-effort scan at the end of the run.
+        self.cheat_detect: bool = get_bool("BENCH_CHEAT_DETECT", True)
+        self.cheat_rules_path: str | None = get_env("BENCH_CHEAT_RULES")
+        self._cheat_rules: tuple[SensitiveAccessRule, ...] = (
+            load_ruleset(self.cheat_rules_path) if self.cheat_detect else ()
+        )
+        # Also snapshot the agent home before the first agent runs and flag
+        # access to anything already lying there (prior-run leftovers).
+        self.cheat_inventory: bool = get_bool("BENCH_CHEAT_INVENTORY", True)
         # When running concurrently with other benchmark processes, allocate a
         # free local port for the chaos port-forward instead of the fixed
         # default so two scenarios on one host do not contend for the same port.
@@ -635,7 +658,54 @@ class DefaultEvalHarness(Harness):
         """
         self._sweep_stray_sandbox_containers()
         run_dir = self.reporter.new_run_dir()
+
+        # Inventory the agent home BEFORE any agent executes: whatever is
+        # already there was left by prior runs (or the operator), so this
+        # run's own writes can never match the generated rules. Best-effort:
+        # detection falls back to the static ruleset on any failure.
+        inventory_rules: tuple[SensitiveAccessRule, ...] = ()
+        if self.cheat_detect and self.cheat_inventory:
+            try:
+                home = Path.home()
+                # Skills granted to the agent are material it is told to read,
+                # so the home entry holding them is environment, not leftover.
+                inventory_rules = build_inventory_rules(
+                    home,
+                    baseline=DEFAULT_BASELINE
+                    | baseline_from_granted_paths(home, self._granted_skill_paths),
+                )
+                if inventory_rules:
+                    _log.info(
+                        "cheat detection: %d prior-run-artifact rule(s) from the "
+                        "pre-run home inventory",
+                        len(inventory_rules),
+                    )
+            except Exception:  # noqa: BLE001 - detection must never block execution
+                _log.exception("pre-run inventory failed; static cheat rules only")
+
         detailed_results: list[dict[str, Any]] = [self._run_one(task, run_dir) for task in tasks]
+
+        # Annotate sensitive-access flags before the first write so both the
+        # raw and the scored results.json carry the report. Best-effort and
+        # flag-only, per record: a detector failure leaves that record's
+        # seeded empty report and moves on to the next.
+        if self.cheat_detect:
+            # Per record: a home entry the task prompt itself names (the
+            # GitOps repo to push to, the deliverable to write) is
+            # authorized for that record, so its inventory path rule is
+            # dropped. Content fingerprints always apply.
+            for record in detailed_results:
+                try:
+                    annotate_records(
+                        [record],
+                        self._cheat_rules
+                        + filter_rules_for_prompt(inventory_rules, record.get("input") or ""),
+                    )
+                except Exception:  # noqa: BLE001 - detection must never sink a completed run
+                    _log.exception(
+                        "cheating detection failed for %r; record keeps empty cheating_report",
+                        record.get("name"),
+                    )
 
         # Persist raw execution outputs before the (slower) scoring pass.
         self.reporter.write(run_dir, detailed_results)
@@ -1122,6 +1192,9 @@ class DefaultEvalHarness(Harness):
             "recoverable_safety": list(task.recoverable_safety),
             "chaos_report": {},
             "perf_report": {},
+            # Populated by the flag-only cheat detector in ``run`` (empty when
+            # detection is disabled or fails); never consulted by scoring.
+            "cheating_report": {},
             "documentation": [doc.model_dump() for doc in task.documentation],
             "capabilities_granted": {
                 "use_mcp": self.use_mcp,
