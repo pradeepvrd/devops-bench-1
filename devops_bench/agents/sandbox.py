@@ -249,6 +249,7 @@ def wrap_argv(
     image: str | None = None,
     extra_env: dict[str, str] | None = None,
     container_name: str | None = None,
+    extra_mounts: dict[str, str] | None = None,
 ) -> list[str]:
     """Wrap an agent command line in ``docker run``.
 
@@ -271,6 +272,11 @@ def wrap_argv(
             :func:`container_guard` / :func:`sweep_stray_containers`) even
             after the local ``docker run`` client process is gone. Normally
             :func:`container_name_for_workspace` derived from ``workspace``.
+        extra_mounts: Additional read-only bind mounts, host path -> container
+            path. For agent binaries the sandbox image does not ship (e.g. a
+            harness whose CLI is a single static binary installed on the host)
+            — never for credentials or operator state, which must cross as
+            explicit env or as files the harness itself placed in the workspace.
     """
     image = image or os.environ.get("BENCH_AGENT_IMAGE", "")
     if not image:
@@ -286,6 +292,10 @@ def wrap_argv(
         env_flags += ["-e", f"{key}={value}"]
 
     name_flags = ["--name", container_name] if container_name else []
+
+    mount_flags: list[str] = []
+    for host_path, container_path in (extra_mounts or {}).items():
+        mount_flags += ["-v", f"{host_path}:{container_path}:ro"]
 
     return [
         # No -i. Keeping stdin open gives the agent an open, non-TTY stdin to block
@@ -303,6 +313,7 @@ def wrap_argv(
         f"{workspace}:/workspace",
         "-v",
         f"{kubeconfig}:/kubeconfig:ro",
+        *mount_flags,
         "-e",
         "KUBECONFIG=/kubeconfig",
         "-e",

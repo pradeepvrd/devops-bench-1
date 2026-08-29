@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -24,7 +25,7 @@ import time
 from typing import TYPE_CHECKING
 
 from devops_bench import core
-from devops_bench.agents import base
+from devops_bench.agents import base, sandbox
 from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
 from devops_bench.agents.cli.antigravity import parsing
@@ -294,32 +295,81 @@ class AgyCliAgent(base.AgentHarness):
             else:
                 _log.warning("Real OAuth token not found at %s", real_token)
 
+            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker.
+            # The workspace (rules, settings.json, skills, the copied OAuth
+            # token) is prepared on the host above and mounted at /workspace,
+            # so only the agy process itself moves into the container. Two
+            # agy-specific adjustments over the gemini wiring:
+            #   * --gemini_dir carries a host path; rewrite it to the
+            #     workspace-relative container path.
+            #   * agy is a single static binary installed on the host, not in
+            #     the sandbox image; bind-mount it in read-only.
+            run_argv = argv
+            sandboxed = False
+            container_name: str | None = None
+            if sandbox.sandbox_enabled():
+                cluster = sandbox.current_cluster_name()
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                if kubeconfig is None:
+                    # Refuse rather than silently running unsandboxed on the host.
+                    return agents_result.AgentResult.errored(
+                        "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could "
+                        "be built; refusing to fall back to an unsandboxed run"
+                    )
+                container_name = sandbox.container_name_for_workspace(workdir)
+                sandbox_argv = [
+                    "--gemini_dir=/workspace/.gemini" if a.startswith("--gemini_dir=") else a
+                    for a in argv
+                ]
+                extra_mounts: dict[str, str] = {}
+                if os.path.isabs(binary) and os.path.exists(binary):
+                    extra_mounts[binary] = "/usr/local/bin/agy"
+                    sandbox_argv[0] = "/usr/local/bin/agy"
+                run_argv = sandbox.wrap_argv(
+                    sandbox_argv,
+                    workspace=workdir,
+                    kubeconfig=kubeconfig,
+                    extra_env=env_overlay,
+                    container_name=container_name,
+                    extra_mounts=extra_mounts or None,
+                )
+                sandboxed = True
+
             completed: devops_subprocess.CompletedProcess | None = None
             timeout_exc: core.SubprocessError | None = None
-            try:
-                completed = devops_subprocess.run(
-                    argv,
-                    extra_env=env_overlay,
-                    cwd=workdir,
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                )
-            except core.SubprocessError as exc:
-                # check=False means this can only be a timeout. agy may have
-                # already written a partial transcript before being killed,
-                # so fall through to recover it instead of returning early
-                # and losing the workspace to the `with` block's cleanup.
-                timeout_exc = exc
-            except OSError as exc:
-                return agents_result.AgentResult.errored(
-                    f"antigravity-cli binary unavailable: {exc}"
-                )
-            finally:
-                # agy only needs the token while running. Remove the copy once it
-                # exits so the live credential never lingers in a workspace that
-                # is deliberately retained for artifact collection.
-                if copied_token is not None:
-                    copied_token.unlink(missing_ok=True)
+            # container_guard reaps the sandbox container by name on every exit
+            # from this block: `--rm` only cleans up when the container's own
+            # process exits, not when the timeout kills the local docker client.
+            guard = (
+                sandbox.container_guard(container_name)
+                if container_name is not None
+                else contextlib.nullcontext()
+            )
+            with guard:
+                try:
+                    completed = devops_subprocess.run(
+                        run_argv,
+                        extra_env=None if sandboxed else env_overlay,
+                        cwd=workdir,
+                        check=False,
+                        timeout=self.config.timeout_sec,
+                    )
+                except core.SubprocessError as exc:
+                    # check=False means this can only be a timeout. agy may have
+                    # already written a partial transcript before being killed,
+                    # so fall through to recover it instead of returning early
+                    # and losing the workspace to the `with` block's cleanup.
+                    timeout_exc = exc
+                except OSError as exc:
+                    return agents_result.AgentResult.errored(
+                        f"antigravity-cli binary unavailable: {exc}"
+                    )
+                finally:
+                    # agy only needs the token while running. Remove the copy once it
+                    # exits so the live credential never lingers in a workspace that
+                    # is deliberately retained for artifact collection.
+                    if copied_token is not None:
+                        copied_token.unlink(missing_ok=True)
 
             # Look for conversations under <gemini_dir>/antigravity-cli/ or <gemini_dir>/
             conv_dir = agy_config_dir / "conversations"

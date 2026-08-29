@@ -907,3 +907,102 @@ def test_agy_cli_agent_discovers_parent_conversations_when_nested_is_empty(
     )
     assert len(result.trajectory) == 2
     assert result.errors == []
+
+
+# ---------------------------------------------------------------------------
+# Sandbox wiring: BENCH_AGENT_SANDBOX=docker wraps agy in docker run, rewrites
+# the host --gemini_dir to its container path, bind-mounts the host binary,
+# and always reaps the container by name.
+# ---------------------------------------------------------------------------
+
+
+def _enable_sandbox(monkeypatch, tmp_path):
+    """Stand in for a working kind cluster + an installed agy binary."""
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "agent-image")
+    # Pin project/location so _execute never shells out to gcloud.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "loc")
+    monkeypatch.setattr(agy_mod.sandbox, "current_cluster_name", lambda: "kind")
+    monkeypatch.setattr(
+        agy_mod.sandbox,
+        "build_agent_kubeconfig",
+        lambda cluster, dest_dir: dest_dir / "kubeconfig",
+    )
+    # These tests drive _execute directly (no base-class safety net), so the
+    # guard's real `docker kill` must never run on a docker-less host.
+    monkeypatch.setattr(agy_mod.sandbox, "kill_container", lambda name: None)
+    binary = tmp_path / "agy"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    return str(binary)
+
+
+@mock.patch.object(pathlib.Path, "home")
+def test_execute_sandboxed_wraps_argv_and_rewrites_gemini_dir(mock_home, monkeypatch, tmp_path):
+    mock_home.return_value = tmp_path
+    binary = _enable_sandbox(monkeypatch, tmp_path)
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs.get("cwd")
+        captured["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(args=argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(devops_subprocess, "run", fake_run)
+    config = agents_config.AgentConfig(target=binary, api_key="k")
+    agy_mod.AgyCliAgent(config)._execute("p")
+
+    argv = captured["argv"]
+    assert argv[:3] == ["docker", "run", "--rm"]
+    # Deterministic container identity derived from the run workspace.
+    workdir_name = captured["cwd"].name
+    assert argv[argv.index("--name") + 1] == f"devops-bench-agent-{workdir_name}"
+    # The host gemini_dir path must not leak into the container argv.
+    assert "--gemini_dir=/workspace/.gemini" in argv
+    assert not any(a.startswith(f"--gemini_dir={captured['cwd']}") for a in argv)
+    # The host binary is bind-mounted read-only and invoked at its mount point.
+    assert f"{binary}:/usr/local/bin/agy:ro" in argv
+    assert "/usr/local/bin/agy" in argv
+    # The resolved overlay crosses as -e flags, not inherited process env.
+    assert captured["extra_env"] is None
+    assert "GEMINI_API_KEY=k" in argv
+
+
+@mock.patch.object(pathlib.Path, "home")
+def test_execute_sandboxed_reaps_container_on_completion_and_timeout(
+    mock_home, monkeypatch, tmp_path
+):
+    mock_home.return_value = tmp_path
+    binary = _enable_sandbox(monkeypatch, tmp_path)
+    killed: list[str] = []
+    monkeypatch.setattr(agy_mod.sandbox, "kill_container", killed.append)
+
+    monkeypatch.setattr(
+        devops_subprocess,
+        "run",
+        lambda argv, **kw: SimpleNamespace(args=argv, returncode=0, stdout="", stderr=""),
+    )
+    agy_mod.AgyCliAgent(agents_config.AgentConfig(target=binary))._execute("p")
+    assert len(killed) == 1 and killed[0].startswith("devops-bench-agent-")
+
+    def raise_timeout(argv, **kw):
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="")
+
+    monkeypatch.setattr(devops_subprocess, "run", raise_timeout)
+    agy_mod.AgyCliAgent(agents_config.AgentConfig(target=binary))._execute("p")
+    assert len(killed) == 2
+
+
+@mock.patch.object(pathlib.Path, "home")
+def test_execute_sandboxed_refuses_without_kubeconfig(mock_home, monkeypatch, tmp_path):
+    mock_home.return_value = tmp_path
+    binary = _enable_sandbox(monkeypatch, tmp_path)
+    monkeypatch.setattr(agy_mod.sandbox, "build_agent_kubeconfig", lambda c, d: None)
+
+    ran: list = []
+    monkeypatch.setattr(devops_subprocess, "run", lambda *a, **kw: ran.append(a))
+    result = agy_mod.AgyCliAgent(agents_config.AgentConfig(target=binary))._execute("p")
+
+    assert result.has_errors()
+    assert ran == []
