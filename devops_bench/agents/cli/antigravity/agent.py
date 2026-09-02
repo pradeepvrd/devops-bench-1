@@ -332,6 +332,7 @@ class AgyCliAgent(base.AgentHarness):
                     extra_env=env_overlay,
                     container_name=container_name,
                     extra_mounts=extra_mounts or None,
+                    fixture_mounts=sandbox.discover_fixture_mounts(cluster) or None,
                 )
                 sandboxed = True
 

@@ -174,3 +174,72 @@ def test_sweep_stray_containers_is_a_noop_when_none_are_running(
 
     kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
     assert kill_calls == []
+
+
+def test_wrap_argv_mounts_fixtures_read_write() -> None:
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        fixture_mounts={"/home/op/opa-repo-c1.git": "/workspace/opa-repo-c1.git"},
+    )
+    # No :ro suffix: the agent has to be able to commit back to a GitOps repo.
+    assert "/home/op/opa-repo-c1.git:/workspace/opa-repo-c1.git" in argv
+    assert "/home/op/opa-repo-c1.git:/workspace/opa-repo-c1.git:ro" not in argv
+
+
+def test_wrap_argv_keeps_extra_mounts_read_only_alongside_fixtures() -> None:
+    argv = sandbox.wrap_argv(
+        ["agy", "--prompt=hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        extra_mounts={"/usr/bin/agy": "/usr/local/bin/agy"},
+        fixture_mounts={"/home/op/report-c1.json": "/workspace/report-c1.json"},
+    )
+    assert "/usr/bin/agy:/usr/local/bin/agy:ro" in argv
+    assert "/home/op/report-c1.json:/workspace/report-c1.json" in argv
+
+
+def test_discover_fixture_mounts_matches_only_this_runs_cluster_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "opa-repo-c1.git").mkdir()
+    (home / "advisory-c1.json").write_text("{}", encoding="utf-8")
+    # Another run's fixture and an unrelated operator file must not be mounted.
+    (home / "opa-repo-c2.git").mkdir()
+    (home / "taxes.pdf").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(sandbox.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sandbox, "scratch_root", lambda: tmp_path / "absent")
+    monkeypatch.delenv(sandbox.FIXTURES_ENV, raising=False)
+
+    mounts = sandbox.discover_fixture_mounts("c1")
+
+    assert sorted(mounts.values()) == [
+        "/workspace/advisory-c1.json",
+        "/workspace/opa-repo-c1.git",
+    ]
+
+
+def test_discover_fixture_mounts_is_empty_without_a_cluster_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(sandbox.FIXTURES_ENV, raising=False)
+    assert sandbox.discover_fixture_mounts(None) == {}
+
+
+def test_discover_fixture_mounts_honours_the_explicit_env_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = tmp_path / "oddly-named-repo.git"
+    fixture.mkdir()
+    monkeypatch.setenv(sandbox.FIXTURES_ENV, f"{fixture}:{tmp_path / 'missing'}")
+
+    mounts = sandbox.discover_fixture_mounts(None)
+
+    # The declared-but-absent path is skipped rather than mounted into a broken
+    # bind; the real one still lands under the container's HOME.
+    assert mounts == {str(fixture.resolve()): "/workspace/oddly-named-repo.git"}

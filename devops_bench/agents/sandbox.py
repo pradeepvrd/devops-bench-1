@@ -48,11 +48,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from devops_bench.core import get_logger
+from devops_bench.core.scratch import scratch_root
 from devops_bench.core.subprocess import run
 
 __all__ = [
     "sandbox_enabled",
     "build_agent_kubeconfig",
+    "discover_fixture_mounts",
     "wrap_argv",
     "container_name_for_workspace",
     "kill_container",
@@ -241,6 +243,68 @@ def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
     return path
 
 
+# Env override naming the task fixtures explicitly, as ``:``-separated host
+# paths. Set it when a task seeds a fixture whose name does not carry the
+# cluster token that :func:`discover_fixture_mounts` keys off.
+FIXTURES_ENV = "BENCH_AGENT_FIXTURES"
+
+
+def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
+    """Find this run's task fixtures on the host and map them into the container.
+
+    A task's stack seeds its inputs (a GitOps repo, a delivered advisory or
+    report) next to the operator's home or under the harness scratch root, and
+    the prompt then points the agent at ``~/<name>``. The container repoints
+    ``HOME`` at ``/workspace`` and mounts neither location, so without this the
+    agent is told to read a file that cannot exist for it — which is not a
+    containment win but a broken task: observed live, agents burn their turn
+    searching the filesystem, and the ones that go looking hardest are the ones
+    that end up probing the host.
+
+    Eligibility is deliberately narrow. Only paths whose name carries the
+    run-unique ``cluster_name`` token match, so this can only ever surface
+    artifacts this run's own stack created — never the operator's other files,
+    and never another concurrent run's fixtures. ``BENCH_AGENT_FIXTURES``
+    overrides the search for stacks that name fixtures some other way.
+
+    Args:
+        cluster_name: The run's cluster name, used as the discriminating token.
+
+    Returns:
+        Host path -> container path, destined for ``wrap_argv``'s
+        ``fixture_mounts``. Empty when nothing matches, which is the normal
+        case for the many tasks that seed no files at all.
+    """
+    explicit = os.environ.get(FIXTURES_ENV, "").strip()
+    if explicit:
+        found = [Path(p).expanduser() for p in explicit.split(":") if p.strip()]
+    elif not cluster_name:
+        return {}
+    else:
+        roots = [Path.home()]
+        with contextlib.suppress(Exception):
+            roots.append(scratch_root())
+        found = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            # Name-carries-the-token, not a recursive walk: a fixture is seeded
+            # at the root itself, and descending would widen this well past
+            # "artifacts of this run".
+            found += sorted(p for p in root.glob(f"*{cluster_name}*") if p.exists())
+
+    mounts: dict[str, str] = {}
+    for path in found:
+        if not path.exists():
+            _log.warning("declared fixture %s does not exist; not mounting", path)
+            continue
+        # HOME is /workspace inside, so a prompt's ``~/<name>`` resolves here.
+        mounts[str(path.resolve())] = f"/workspace/{path.name}"
+    if mounts:
+        _log.info("mounting %d task fixture(s) into the sandbox: %s", len(mounts), list(mounts))
+    return mounts
+
+
 def wrap_argv(
     argv: list[str],
     *,
@@ -250,6 +314,7 @@ def wrap_argv(
     extra_env: dict[str, str] | None = None,
     container_name: str | None = None,
     extra_mounts: dict[str, str] | None = None,
+    fixture_mounts: dict[str, str] | None = None,
 ) -> list[str]:
     """Wrap an agent command line in ``docker run``.
 
@@ -277,6 +342,13 @@ def wrap_argv(
             harness whose CLI is a single static binary installed on the host)
             — never for credentials or operator state, which must cross as
             explicit env or as files the harness itself placed in the workspace.
+        fixture_mounts: Task fixtures, host path -> container path, mounted
+            READ-WRITE. These are inputs the task prompt names and the agent is
+            meant to read and (for a GitOps repo) commit back to, so a
+            read-only mount would fail the task just as surely as no mount.
+            Distinct from ``extra_mounts`` precisely because the write bit is
+            a deliberate, per-path decision — see
+            :func:`discover_fixture_mounts` for what is eligible.
     """
     image = image or os.environ.get("BENCH_AGENT_IMAGE", "")
     if not image:
@@ -296,6 +368,8 @@ def wrap_argv(
     mount_flags: list[str] = []
     for host_path, container_path in (extra_mounts or {}).items():
         mount_flags += ["-v", f"{host_path}:{container_path}:ro"]
+    for host_path, container_path in (fixture_mounts or {}).items():
+        mount_flags += ["-v", f"{host_path}:{container_path}"]
 
     return [
         # No -i. Keeping stdin open gives the agent an open, non-TTY stdin to block
